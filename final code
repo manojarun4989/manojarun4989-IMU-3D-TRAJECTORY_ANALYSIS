@@ -1,0 +1,338 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+import os
+from scipy.signal import butter, filtfilt
+from scipy.spatial.transform import Rotation
+from filterpy.kalman import KalmanFilter
+from scipy.fft import fft, fftfreq
+from scipy.optimize import least_squares
+
+class BatSwingAnalyzer:
+    def __init__(self, filename, dt=0.01):
+        if not os.path.exists(filename):
+            raise FileNotFoundError(f"Data file not found at: {filename}")
+        self.filename = filename
+        self.dt = dt
+        self.fs = 1 / dt
+        self.raw_data, self.cal_params, self.calibrated_data, self.filtered_data, self.kinematics, self.metrics = {}, {}, {}, {}, {}, {}
+
+    def _load_data(self):
+        acc, gyro = [], []
+        pattern = (
+            r"X1\s*[:=]?\s*(-?[\d.]+)\s*,\s*Y1\s*[:=]?\s*(-?[\d.]+)\s*,\s*Z1\s*[:=]?\s*(-?[\d.]+)\s*,\s*"
+            r"A1\s*[:=]?\s*(-?[\d.]+)\s*,\s*B1\s*[:=]?\s*(-?[\d.]+)\s*,\s*C1\s*[:=]?\s*(-?[\d.]+)\s*,\s*"
+            r"M1\s*[:=]?\s*(-?[\d.]+)\s*,\s*N1\s*[:=]?\s*(-?[\d.]+)\s*,\s*O1\s*[:=]?\s*(-?[\d.]+)"
+        )
+        with open(self.filename, 'r', encoding='utf-8') as f:
+            for line in f:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    values = [float(v) for v in match.groups()]
+                    acc.append(values[3:6]); gyro.append(values[6:9])
+        if not acc: raise ValueError("No valid data points found in file.")
+
+        self.raw_data = {'acc': np.array(acc), 'gyro': np.array(gyro)}
+        self.time = np.arange(0, len(acc) * self.dt, self.dt)
+
+    def _calibrate_sensors_advanced(self):
+        acc_data, gyro_data = self.raw_data['acc'], self.raw_data['gyro']
+        acc_mag_std = np.array([np.std(acc_data[i:i+50, :]) for i in range(len(acc_data) - 50)])
+        static_indices = np.where(acc_mag_std < 0.5)[0]
+
+        if len(static_indices) < 100:
+            gyro_bias = np.mean(gyro_data[:100], axis=0)
+            accel_bias = np.mean(acc_data[:100], axis=0) - [0, 0, 9.81]
+            accel_scale = np.ones(3)
+        else:
+            gyro_bias = np.mean(gyro_data[static_indices], axis=0)
+            static_acc_data = acc_data[static_indices]
+            def residual(params, data, g_ref):
+                bias = params[:3]
+                scale = params[3:]
+                calibrated_data = (data - bias) / scale
+                magnitudes = np.linalg.norm(calibrated_data, axis=1)
+                return magnitudes - g_ref
+            initial_params = np.array([0, 0, 0, 1, 1, 1])
+            res = least_squares(residual, initial_params, args=(static_acc_data, 9.81), method='trf')
+            accel_bias = res.x[:3]
+            accel_scale = res.x[3:]
+
+        self.cal_params = {'acc_bias': accel_bias, 'acc_scale': accel_scale, 'gyro_bias': gyro_bias}
+
+    def _apply_filters_and_kinematics(self):
+        acc_cal = (self.raw_data['acc'] - self.cal_params['acc_bias']) / self.cal_params['acc_scale']
+        gyro_cal = self.raw_data['gyro'] - self.cal_params['gyro_bias']
+        self.calibrated_data = {'acc': acc_cal, 'gyro': gyro_cal}
+
+        def butter_lowpass(data, cutoff, order=4):
+            nyq = 0.5 * self.fs
+            normal_cutoff = max(0.001, min(0.999, cutoff / nyq))
+            b, a = butter(order, normal_cutoff, btype='low', analog=False)
+            return filtfilt(b, a, data, axis=0)
+        def kalman_smooth(data):
+            smoothed = np.zeros_like(data)
+            for i in range(data.shape[1]):
+                kf = KalmanFilter(dim_x=2, dim_z=1)
+                kf.F=np.array([[1,self.dt],[0,1]]); kf.H=np.array([[1,0]])
+                kf.Q*=0.05; kf.R*=0.1; kf.x=np.array([data[0,i],0])
+                s,_,_,_ = kf.batch_filter(data[:,i]); smoothed[:,i] = s[:,0]
+            return smoothed
+
+        acc_filt = kalman_smooth(butter_lowpass(acc_cal, 30))
+        gyro_filt = kalman_smooth(butter_lowpass(gyro_cal, 40))
+        self.filtered_data = {'acc': acc_filt, 'gyro': gyro_filt}
+
+        n_samples = len(acc_filt)
+        gyro_mag = np.linalg.norm(gyro_filt, axis=1)
+        is_static = np.convolve(gyro_mag < 0.5, np.ones(15, dtype=int), 'same') > 10
+
+        self.kinematics = {'orientations': np.zeros((n_samples,4)), 'velocity': np.zeros((n_samples,3)), 'position': np.zeros((n_samples,3))}
+        self.kinematics['orientations'][0] = [1,0,0,0]
+        r = Rotation.identity()
+
+        for i in range(1, n_samples):
+            r *= Rotation.from_rotvec(gyro_filt[i] * self.dt)
+            gravity_vec = r.inv().apply([0, 0, 9.81])
+            world_linear_acc = r.apply(acc_filt[i] - gravity_vec)
+            v = self.kinematics['velocity'][i-1] + world_linear_acc * self.dt
+            if is_static[i]: v *= 0.5
+            self.kinematics['velocity'][i] = v
+            self.kinematics['position'][i] = self.kinematics['position'][i-1] + v * self.dt
+            self.kinematics['orientations'][i] = r.as_quat()
+
+    def _analyze_swing(self, swing_threshold):
+        gyro_mag = np.linalg.norm(self.filtered_data['gyro'], axis=1)
+        swing_indices = np.where(gyro_mag > swing_threshold)[0]
+        if not len(swing_indices):
+            self.metrics = {}; return
+
+        start = swing_indices[0]
+        end = min(swing_indices[-1] + int(0.15 / self.dt), len(self.time) - 1)
+        speed_kmh = np.linalg.norm(self.kinematics['velocity'], axis=1) * 3.6
+        impact_idx = start + np.argmax(speed_kmh[start:end])
+
+        self.metrics = {
+            'swing_phase': (start, end), 'impact_index': impact_idx,
+            'peak_speed_kmh': speed_kmh[impact_idx],
+            'peak_angular_vel_dps': np.rad2deg(gyro_mag[impact_idx]),
+            'time_to_impact_ms': (impact_idx - start) * self.dt * 1000
+        }
+
+    def run_analysis(self, swing_threshold=3.0):
+        self._load_data()
+        self._calibrate_sensors_advanced()
+        self._apply_filters_and_kinematics()
+        self._analyze_swing(swing_threshold)
+        return self.metrics
+
+    def plot_summary(self):
+        if not self.metrics: return
+
+        fig = plt.figure(figsize=(18, 15))
+        fig.suptitle('Bat Swing Analysis Results', fontsize=22)
+        gs = fig.add_gridspec(3, 2, height_ratios=[2, 1, 1])
+
+        ax1 = fig.add_subplot(gs[0, :], projection='3d')
+        start, end = self.metrics['swing_phase']
+        impact_idx = self.metrics['impact_index']
+        p = self.kinematics['position']
+
+        ax1.plot(p[start:end, 0], p[start:end, 1], p[start:end, 2], label='Swing Path', lw=2.5, c='dodgerblue')
+        ax1.scatter(p[start, 0], p[start, 1], p[start, 2], c='g', s=120, marker='o', label='Start', depthshade=False)
+        ax1.scatter(p[impact_idx, 0], p[impact_idx, 1], p[impact_idx, 2], c='r', s=200, marker='*', label='Impact', depthshade=False)
+        ax1.set_title('3D Swing Trajectory')
+        ax1.set_xlabel('X (m)'); ax1.set_ylabel('Y (m)'); ax1.set_zlabel('Z (m)')
+        ax1.legend(); ax1.grid(True)
+
+        ax2 = fig.add_subplot(gs[1, 0])
+        bat_speed_kmh = np.linalg.norm(self.kinematics['velocity'], axis=1) * 3.6
+        ax2.plot(self.time, bat_speed_kmh, label='Bat Speed')
+        ax2.axvline(self.time[impact_idx], color='r', ls='--', label=f"Peak: {self.metrics['peak_speed_kmh']:.1f} km/h")
+        ax2.set_title('Bat Speed'); ax2.set_xlabel('Time (s)'); ax2.set_ylabel('Speed (km/h)')
+        ax2.legend(); ax2.grid(True)
+
+        ax3 = fig.add_subplot(gs[1, 1])
+        angular_vel_dps = np.rad2deg(np.linalg.norm(self.filtered_data['gyro'], axis=1))
+        ax3.plot(self.time, angular_vel_dps, label='Angular Velocity')
+        ax3.axvline(self.time[impact_idx], color='r', ls='--', label=f"Peak: {self.metrics['peak_angular_vel_dps']:.1f} deg/s")
+        ax3.set_title('Angular Velocity'); ax3.set_xlabel('Time (s)'); ax3.set_ylabel('deg/s')
+        ax3.legend(); ax3.grid(True)
+
+        ax4 = fig.add_subplot(gs[2, :]); ax4.axis('off')
+        metrics_text = (f"--- Performance Metrics ---\nPeak Bat Speed:      {self.metrics['peak_speed_kmh']:.2f} km/h\n"
+                        f"Peak Angular Velocity: {self.metrics['peak_angular_vel_dps']:.2f} deg/s\n"
+                        f"Time to Impact:        {self.metrics['time_to_impact_ms']:.0f} ms")
+        ax4.text(0.5, 0.6, metrics_text, fontsize=16, ha='center', va='center',
+                 bbox=dict(boxstyle="round,pad=0.7", fc="aliceblue", ec="black", lw=1))
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig('bat_swing_summary.png', dpi=300)
+        plt.show()
+
+    def plot_fft_analysis(self):
+        if not self.metrics: return
+
+        start, end = self.metrics['swing_phase']
+        signals = {
+            "Velocity X": self.kinematics['velocity'][start:end, 0],
+            "Velocity Y": self.kinematics['velocity'][start:end, 1],
+            "Velocity Z": self.kinematics['velocity'][start:end, 2],
+            "Gyro X": self.filtered_data['gyro'][start:end, 0],
+            "Gyro Y": self.filtered_data['gyro'][start:end, 1],
+            "Gyro Z": self.filtered_data['gyro'][start:end, 2],
+        }
+
+        fig, axs = plt.subplots(3, 2, figsize=(15, 12))
+        fig.suptitle('Frequency Analysis (FFT) of the Swing', fontsize=18)
+        axs = axs.ravel()
+
+        for i, (title, signal) in enumerate(signals.items()):
+            n = len(signal)
+            if n == 0: continue
+            yf = fft(signal)
+            xf = fftfreq(n, self.dt)[:n//2]
+            magnitude = 2.0/n * np.abs(yf[0:n//2])
+
+            axs[i].plot(xf, magnitude)
+            axs[i].set_title(title)
+            axs[i].set_xlabel("Frequency (Hz)")
+            axs[i].set_ylabel("Magnitude")
+            axs[i].grid(True)
+            axs[i].set_xlim(0, 20)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig('fft_analysis.png', dpi=300)
+        plt.show()
+
+def plot_all_stages(analyzer):
+    if not all(k in analyzer.filtered_data for k in ['acc', 'gyro']): return
+
+    time = analyzer.time
+    raw_acc = analyzer.raw_data['acc']
+    cal_acc = analyzer.calibrated_data['acc']
+    filt_acc = analyzer.filtered_data['acc']
+    raw_gyro = analyzer.raw_data['gyro']
+    cal_gyro = analyzer.calibrated_data['gyro']
+    filt_gyro = analyzer.filtered_data['gyro']
+
+    fig, axes = plt.subplots(3, 2, figsize=(18, 16), sharex=True)
+    fig.suptitle('Data Processing Stages Comparison (All Axes)', fontsize=20)
+
+    axis_labels = ['X', 'Y', 'Z']
+    colors = ['#E63946', '#457B9D', '#1D3557'] # Red, Blue, Dark Blue
+
+    for i in range(3):
+        # Accelerometer plots (left column)
+        ax_acc = axes[i, 0]
+        ax_acc.plot(time, raw_acc[:, i], color=colors[i], alpha=0.3, label='Stage 1: Raw')
+        ax_acc.plot(time, cal_acc[:, i], color=colors[i], linestyle='--', alpha=0.7, label='Stage 2: Calibrated')
+        ax_acc.plot(time, filt_acc[:, i], color=colors[i], linestyle='-', linewidth=2, label='Stage 3: Filtered')
+        ax_acc.set_title(f'Accelerometer {axis_labels[i]}-Axis')
+        ax_acc.set_ylabel('Acceleration ($m/s^2$)')
+        ax_acc.legend()
+        ax_acc.grid(True)
+
+        # Gyroscope plots (right column)
+        ax_gyro = axes[i, 1]
+        ax_gyro.plot(time, raw_gyro[:, i], color=colors[i], alpha=0.3, label='Stage 1: Raw')
+        ax_gyro.plot(time, cal_gyro[:, i], color=colors[i], linestyle='--', alpha=0.7, label='Stage 2: Calibrated')
+        ax_gyro.plot(time, filt_gyro[:, i], color=colors[i], linestyle='-', linewidth=2, label='Stage 3: Filtered')
+        ax_gyro.set_title(f'Gyroscope {axis_labels[i]}-Axis')
+        ax_gyro.set_ylabel('Ang. Velocity (rad/s)')
+        ax_gyro.legend()
+        ax_gyro.grid(True)
+
+    # Add shared X-axis label
+    axes[2, 0].set_xlabel('Time (s)')
+    axes[2, 1].set_xlabel('Time (s)')
+
+    if 'impact_index' in analyzer.metrics:
+        impact_time = analyzer.time[analyzer.metrics['impact_index']]
+        for i in range(3):
+            for j in range(2):
+                axes[i, j].axvline(x=impact_time, color='k', linestyle=':', linewidth=2)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+    plt.savefig('all_processing_stages_all_axes.png', dpi=300)
+    plt.show()
+
+def plot_sensor_stage_analysis(analyzer):
+    if not analyzer.metrics: return
+
+    time = analyzer.time
+    raw_acc, filt_acc = analyzer.raw_data['acc'], analyzer.filtered_data['acc']
+    raw_gyro, filt_gyro = analyzer.raw_data['gyro'], analyzer.filtered_data['gyro']
+    impact_time = time[analyzer.metrics['impact_index']]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 12), sharex=True)
+    fig.suptitle('Sensor Data Analysis: Raw vs. Filtered', fontsize=20)
+
+    ax1.plot(time, raw_acc[:, 0], 'r--', alpha=0.5, label='Raw X')
+    ax1.plot(time, raw_acc[:, 1], 'g--', alpha=0.5, label='Raw Y')
+    ax1.plot(time, raw_acc[:, 2], 'b--', alpha=0.5, label='Raw Z')
+    ax1.plot(time, filt_acc[:, 0], 'r-', label='Filtered X')
+    ax1.plot(time, filt_acc[:, 1], 'g-', label='Filtered Y')
+    ax1.plot(time, filt_acc[:, 2], 'b-', label='Filtered Z')
+    ax1.axvline(x=impact_time, color='k', linestyle=':', linewidth=2, label=f'Impact @ {impact_time:.2f}s')
+    ax1.set_title('Accelerometer Analysis')
+    ax1.set_ylabel('Acceleration (m/s²)')
+    ax1.legend(); ax1.grid(True)
+
+    ax2.plot(time, raw_gyro[:, 0], 'r--', alpha=0.5, label='Raw X')
+    ax2.plot(time, raw_gyro[:, 1], 'g--', alpha=0.5, label='Raw Y')
+    ax2.plot(time, raw_gyro[:, 2], 'b--', alpha=0.5, label='Raw Z')
+    ax2.plot(time, filt_gyro[:, 0], 'r-', label='Filtered X')
+    ax2.plot(time, filt_gyro[:, 1], 'g-', label='Filtered Y')
+    ax2.plot(time, filt_gyro[:, 2], 'b-', label='Filtered Z')
+    ax2.axvline(x=impact_time, color='k', linestyle=':', linewidth=2, label=f'Impact @ {impact_time:.2f}s')
+    ax2.set_title('Gyroscope Analysis')
+    ax2.set_ylabel('Angular Velocity (rad/s)')
+    ax2.set_xlabel('Time (s)')
+    ax2.legend(); ax2.grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig('sensor_stage_analysis.png', dpi=300)
+    plt.show()
+
+def plot_angular_velocity_and_speed(analyzer):
+    if not analyzer.metrics: return
+
+    time = analyzer.time
+    angular_velocity = analyzer.filtered_data['gyro']
+    angular_speed = np.linalg.norm(angular_velocity, axis=1)
+    impact_time = time[analyzer.metrics['impact_index']]
+    peak_speed_dps = analyzer.metrics['peak_angular_vel_dps']
+
+    plt.figure(figsize=(15, 8))
+    plt.plot(time, angular_velocity[:, 0], '--', label='Angular Velocity X', alpha=0.8)
+    plt.plot(time, angular_velocity[:, 1], '--', label='Angular Velocity Y', alpha=0.8)
+    plt.plot(time, angular_velocity[:, 2], '--', label='Angular Velocity Z', alpha=0.8)
+    plt.plot(time, angular_speed, 'k-', linewidth=2.5, label='Total Angular Speed (Magnitude)')
+    plt.axvline(x=impact_time, color='r', linestyle=':', linewidth=2, label=f'Impact / Peak Speed ({peak_speed_dps:.0f} deg/s)')
+    plt.title('Angular Velocity & Speed Analysis', fontsize=18)
+    plt.xlabel('Time (s)', fontsize=12)
+    plt.ylabel('Angular Velocity (rad/s)', fontsize=12)
+    plt.legend(); plt.grid(True)
+    plt.tight_layout()
+    plt.savefig('angular_velocity_analysis.png', dpi=300)
+    plt.show()
+
+if __name__ == "__main__":
+    try:
+        FILENAME = '/content/drive/MyDrive/Project/CrickET Analysis /Sweep Shot.txt'
+        SWING_THRESHOLD = 3.5
+        RUN_FFT_ANALYSIS = True
+
+        analyzer = BatSwingAnalyzer(filename=FILENAME)
+        metrics = analyzer.run_analysis(swing_threshold=SWING_THRESHOLD)
+
+        if metrics:
+            analyzer.plot_summary()
+            plot_all_stages(analyzer)
+            plot_sensor_stage_analysis(analyzer)
+            plot_angular_velocity_and_speed(analyzer)
+            if RUN_FFT_ANALYSIS:
+                analyzer.plot_fft_analysis()
+    except Exception as e:
+        print(f"\nERROR: {e}")
